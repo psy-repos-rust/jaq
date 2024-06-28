@@ -1,13 +1,15 @@
 //! JSON values with reference-counted sharing.
 
+use crate::box_iter::{box_once, BoxIter};
 use crate::error::{Error, Type};
 use alloc::string::{String, ToString};
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cmp::Ordering;
-use core::fmt;
+use core::fmt::{self, Debug, Display};
+use core::ops::{Add, Div, Mul, Neg, Rem, Sub};
 #[cfg(feature = "hifijson")]
 use hifijson::{LexAlloc, Token};
-use jaq_syn::MathOp;
+use jaq_syn::{path::Opt, MathOp};
 
 /// JSON value with sharing.
 ///
@@ -46,12 +48,320 @@ type Map<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
 pub type ValR = Result<Val, Error>;
 
 /// A stream of value results.
-pub type ValRs<'a> = Box<dyn Iterator<Item = ValR> + 'a>;
+pub type ValRs<'a> = BoxIter<'a, ValR>;
 
 // This might be included in the Rust standard library:
 // <https://github.com/rust-lang/rust/issues/93610>
 fn rc_unwrap_or_clone<T: Clone>(a: Rc<T>) -> T {
     Rc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())
+}
+
+pub type ValR2<V> = Result<V, Error<V>>;
+pub type ValR2s<'a, V> = BoxIter<'a, ValR2<V>>;
+
+// This makes `f64::from_str` accessible as intra-doc link.
+#[cfg(doc)]
+use core::str::FromStr;
+
+/// Values that can be processed by the interpreter.
+///
+/// Implement this trait if you want jaq to process your own type of values.
+pub trait ValT:
+    Clone
+    + Display
+    + From<bool>
+    + From<isize>
+    + From<String>
+    + FromIterator<Self>
+    + PartialEq
+    + PartialOrd
+    + Add<Output = ValR2<Self>>
+    + Sub<Output = ValR2<Self>>
+    + Mul<Output = ValR2<Self>>
+    + Div<Output = ValR2<Self>>
+    + Rem<Output = ValR2<Self>>
+    + Neg<Output = ValR2<Self>>
+{
+    /// Create a number from a string.
+    ///
+    /// The number should adhere to the format accepted by [`f64::from_str`].
+    fn from_num(n: &str) -> ValR2<Self>;
+
+    /// Create an associative map (or object) from a sequence of key-value pairs.
+    ///
+    /// This is used when creating values with the syntax `{k: v}`.
+    fn from_map<I: IntoIterator<Item = (Self, Self)>>(iter: I) -> ValR2<Self>;
+
+    /// Yield the children of a value.
+    ///
+    /// This is used by `.[]`.
+    fn values(self) -> Box<dyn Iterator<Item = ValR2<Self>>>;
+
+    /// Yield the child of a value at the given index.
+    ///
+    /// This is used by `.[k]`.
+    ///
+    /// If `v.index(k)` is `Ok(_)`, then it is contained in `v.values()`.
+    fn index(self, index: &Self) -> ValR2<Self>;
+
+    /// Yield a slice of the value with the given range.
+    ///
+    /// This is used by `.[s:e]`, `.[s:]`, and `.[:e]`.
+    fn range(self, range: Range<&Self>) -> ValR2<Self>;
+
+    /// Map a function over the children of the value.
+    ///
+    /// This is used by
+    /// - `.[]  |= f` (`opt` = [`Opt::Essential`]) and
+    /// - `.[]? |= f` (`opt` = [`Opt::Optional`]).
+    ///
+    /// If the children of the value are undefined, then:
+    ///
+    /// - If `opt` is [`Opt::Essential`], return an error.
+    /// - If `opt` is [`Opt::Optional`] , return the input value.
+    fn map_values<I: Iterator<Item = ValR2<Self>>>(
+        self,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValR2<Self>;
+
+    /// Map a function over the child of the value at the given index.
+    ///
+    /// This is used by `.[k] |= f`.
+    ///
+    /// See [`Self::map_values`] for the behaviour of `opt`.
+    fn map_index<I: Iterator<Item = ValR2<Self>>>(
+        self,
+        index: &Self,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValR2<Self>;
+
+    /// Map a function over the slice of the value with the given range.
+    ///
+    /// This is used by `.[s:e] |= f`, `.[s:] |= f`, and `.[:e] |= f`.
+    ///
+    /// See [`Self::map_values`] for the behaviour of `opt`.
+    fn map_range<I: Iterator<Item = ValR2<Self>>>(
+        self,
+        range: Range<&Self>,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValR2<Self>;
+
+    /// Return a boolean representation of the value.
+    ///
+    /// This is used by `if v then ...`.
+    fn as_bool(&self) -> bool;
+
+    /// If the value is a string, return it.
+    ///
+    /// If `v.as_str()` yields `Some(s)`, then
+    /// `"\(v)"` yields `s`, otherwise it yields `v.to_string()`
+    /// (provided by [`Display`]).
+    fn as_str(&self) -> Option<&str>;
+}
+
+type Range<V> = core::ops::Range<Option<V>>;
+
+impl ValT for Val {
+    fn from_num(n: &str) -> ValR2<Self> {
+        Ok(Val::Num(Rc::new(n.to_string())))
+    }
+
+    fn from_map<I: IntoIterator<Item = (Self, Self)>>(iter: I) -> ValR2<Self> {
+        let iter = iter.into_iter().map(|(k, v)| Ok((k.to_str()?, v)));
+        Ok(Self::obj(iter.collect::<Result<_, _>>()?))
+    }
+
+    fn values(self) -> Box<dyn Iterator<Item = ValR2<Self>>> {
+        match self {
+            Self::Arr(a) => Box::new(rc_unwrap_or_clone(a).into_iter().map(Ok)),
+            Self::Obj(o) => Box::new(rc_unwrap_or_clone(o).into_iter().map(|(_k, v)| Ok(v))),
+            _ => box_once(Err(Error::Type(self, Type::Iter))),
+        }
+    }
+
+    fn index(self, index: &Self) -> ValR {
+        match (self, index) {
+            (Val::Arr(a), Val::Int(i)) => Ok(abs_index(*i, a.len())
+                .map(|i| a[i].clone())
+                .unwrap_or(Val::Null)),
+            (Val::Obj(o), Val::Str(s)) => Ok(o.get(s).cloned().unwrap_or(Val::Null)),
+            (s @ (Val::Arr(_) | Val::Obj(_)), _) => Err(Error::Index(s, index.clone())),
+            (s, _) => Err(Error::Type(s, Type::Iter)),
+        }
+    }
+
+    fn range(self, range: Range<&Self>) -> ValR {
+        let (from, upto) = (range.start, range.end);
+        match self {
+            Val::Arr(a) => {
+                let len = a.len();
+                let from = from.as_ref().map(|i| i.as_int()).transpose();
+                let upto = upto.as_ref().map(|i| i.as_int()).transpose();
+                from.and_then(|from| Ok((from, upto?))).map(|(from, upto)| {
+                    let from = abs_bound(from, len, 0);
+                    let upto = abs_bound(upto, len, len);
+                    let (skip, take) = skip_take(from, upto);
+                    a.iter().skip(skip).take(take).cloned().collect()
+                })
+            }
+            Val::Str(s) => {
+                let len = s.chars().count();
+                let from = from.as_ref().map(|i| i.as_int()).transpose();
+                let upto = upto.as_ref().map(|i| i.as_int()).transpose();
+                from.and_then(|from| Ok((from, upto?))).map(|(from, upto)| {
+                    let from = abs_bound(from, len, 0);
+                    let upto = abs_bound(upto, len, len);
+                    let (skip, take) = skip_take(from, upto);
+                    Val::from(s.chars().skip(skip).take(take).collect::<String>())
+                })
+            }
+            _ => Err(Error::Type(self, Type::Range)),
+        }
+    }
+
+    fn map_values<I: Iterator<Item = ValR>>(self, opt: Opt, f: impl Fn(Self) -> I) -> ValR {
+        match self {
+            Self::Arr(a) => {
+                let iter = rc_unwrap_or_clone(a).into_iter().flat_map(f);
+                Ok(iter.collect::<Result<_, _>>()?)
+            }
+            Self::Obj(o) => {
+                let iter = rc_unwrap_or_clone(o).into_iter();
+                let iter = iter.filter_map(|(k, v)| f(v).next().map(|v| Ok((k, v?))));
+                Ok(Self::obj(iter.collect::<Result<_, _>>()?))
+            }
+            v => opt.fail(v, |v| Error::Type(v, Type::Iter)),
+        }
+    }
+
+    fn map_index<I: Iterator<Item = ValR>>(
+        mut self,
+        index: &Self,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValR {
+        match self {
+            Val::Obj(ref mut o) => {
+                let o = Rc::make_mut(o);
+                use indexmap::map::Entry::{Occupied, Vacant};
+                let i = match index {
+                    Val::Str(s) => s,
+                    i => return opt.fail(self, |v| Error::Index(v, i.clone())),
+                };
+                match o.entry(Rc::clone(i)) {
+                    Occupied(mut e) => {
+                        match f(e.get().clone()).next().transpose()? {
+                            Some(y) => e.insert(y),
+                            // this runs in constant time, at the price of
+                            // changing the order of the elements
+                            None => e.swap_remove(),
+                        };
+                    }
+                    Vacant(e) => {
+                        if let Some(y) = f(Val::Null).next().transpose()? {
+                            e.insert(y);
+                        }
+                    }
+                }
+                Ok(self)
+            }
+            Val::Arr(ref mut a) => {
+                let a = Rc::make_mut(a);
+                let abs_or = |i| abs_index(i, a.len()).ok_or(Error::IndexOutOfBounds(i));
+                let i = match index.as_int().and_then(abs_or) {
+                    Ok(i) => i,
+                    Err(e) => return opt.fail(self, |_| e),
+                };
+
+                if let Some(y) = f(a[i].clone()).next().transpose()? {
+                    a[i] = y;
+                } else {
+                    a.remove(i);
+                }
+                Ok(self)
+            }
+            _ => opt.fail(self, |v| Error::Type(v, Type::Iter)),
+        }
+    }
+
+    fn map_range<I: Iterator<Item = ValR>>(
+        mut self,
+        range: Range<&Self>,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValR {
+        if let Val::Arr(ref mut a) = self {
+            let a = Rc::make_mut(a);
+            let from = range.start.as_ref().map(|i| i.as_int()).transpose();
+            let upto = range.end.as_ref().map(|i| i.as_int()).transpose();
+            let (from, upto) = match from.and_then(|from| Ok((from, upto?))) {
+                Ok(from_upto) => from_upto,
+                Err(e) => return opt.fail(self, |_| e),
+            };
+            let len = a.len();
+            let from = abs_bound(from, len, 0);
+            let upto = abs_bound(upto, len, len);
+            let (skip, take) = skip_take(from, upto);
+            let arr = Val::arr(a.iter().skip(skip).take(take).cloned().collect());
+            let y = f(arr).map(|y| y?.into_arr()).next().transpose()?;
+            a.splice(skip..skip + take, (*y.unwrap_or_default()).clone());
+            Ok(self)
+        } else {
+            opt.fail(self, |v| Error::Type(v, Type::Arr))
+        }
+    }
+
+    fn as_bool(&self) -> bool {
+        self.as_bool()
+    }
+
+    /// If the value is a string, return it, else fail.
+    fn as_str(&self) -> Option<&str> {
+        if let Self::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+}
+
+fn skip_take(from: usize, until: usize) -> (usize, usize) {
+    (from, if until > from { until - from } else { 0 })
+}
+
+/// If a range bound is given, absolutise and clip it between 0 and `len`,
+/// else return `default`.
+fn abs_bound(i: Option<isize>, len: usize, default: usize) -> usize {
+    let abs = |i| core::cmp::min(wrap(i, len).unwrap_or(0), len);
+    i.map(abs).unwrap_or(default)
+}
+
+/// Absolutise an index and return result if it is inside [0, len).
+fn abs_index(i: isize, len: usize) -> Option<usize> {
+    wrap(i, len).filter(|i| *i < len)
+}
+
+fn wrap(i: isize, len: usize) -> Option<usize> {
+    if i >= 0 {
+        Some(i as usize)
+    } else if len < -i as usize {
+        None
+    } else {
+        Some(len - (-i as usize))
+    }
+}
+
+#[test]
+fn wrap_test() {
+    let len = 4;
+    assert_eq!(wrap(0, len), Some(0));
+    assert_eq!(wrap(8, len), Some(8));
+    assert_eq!(wrap(-1, len), Some(3));
+    assert_eq!(wrap(-4, len), Some(0));
+    assert_eq!(wrap(-8, len), None);
 }
 
 impl Val {
@@ -178,27 +488,13 @@ impl Val {
     /// Return the elements of an array or the values of an object (omitting its keys).
     ///
     /// Fail on any other value.
+    #[deprecated(since = "1.3.0", note = "use `ValT::values` instead")]
     pub fn try_into_iter(self) -> Result<Box<dyn Iterator<Item = Self>>, Error> {
         match self {
             Self::Arr(a) => Ok(Box::new(rc_unwrap_or_clone(a).into_iter())),
             Self::Obj(o) => Ok(Box::new(rc_unwrap_or_clone(o).into_iter().map(|(_k, v)| v))),
             _ => Err(Error::Type(self, Type::Iter)),
         }
-    }
-
-    pub(crate) fn try_map<I: Iterator<Item = ValR>>(self, f: impl Fn(Self) -> I) -> ValR {
-        Ok(match self {
-            Self::Arr(a) => {
-                let iter = rc_unwrap_or_clone(a).into_iter().flat_map(f);
-                Self::arr(iter.collect::<Result<_, _>>()?)
-            }
-            Self::Obj(o) => {
-                let iter = rc_unwrap_or_clone(o).into_iter();
-                let iter = iter.filter_map(|(k, v)| f(v).next().map(|v| Ok((k, v?))));
-                Self::obj(iter.collect::<Result<_, _>>()?)
-            }
-            v => v,
-        })
     }
 
     /// `a` contains `b` iff either
@@ -329,6 +625,36 @@ impl From<Val> for serde_json::Value {
     }
 }
 
+impl From<bool> for Val {
+    fn from(b: bool) -> Self {
+        Self::Bool(b)
+    }
+}
+
+impl From<isize> for Val {
+    fn from(i: isize) -> Self {
+        Self::Int(i)
+    }
+}
+
+impl From<f64> for Val {
+    fn from(f: f64) -> Self {
+        Self::Float(f)
+    }
+}
+
+impl From<String> for Val {
+    fn from(s: String) -> Self {
+        Self::Str(Rc::new(s))
+    }
+}
+
+impl FromIterator<Self> for Val {
+    fn from_iter<T: IntoIterator<Item = Self>>(iter: T) -> Self {
+        Self::Arr(Rc::new(iter.into_iter().collect()))
+    }
+}
+
 impl core::ops::Add for Val {
     type Output = ValR;
     fn add(self, rhs: Self) -> Self::Output {
@@ -416,7 +742,7 @@ impl core::ops::Mul for Val {
 }
 
 /// Split a string by a given separator string.
-fn split<'a>(s: &'a str, sep: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+fn split<'a>(s: &'a str, sep: &'a str) -> BoxIter<'a, String> {
     if s.is_empty() {
         Box::new(core::iter::empty())
     } else if sep.is_empty() {
@@ -477,9 +803,9 @@ impl PartialEq for Val {
             (Self::Bool(x), Self::Bool(y)) => x == y,
             (Self::Int(x), Self::Int(y)) => x == y,
             (Self::Int(i), Self::Float(f)) | (Self::Float(f), Self::Int(i)) => {
-                float_eq(&(*i as f64), f)
+                float_eq(*i as f64, *f)
             }
-            (Self::Float(x), Self::Float(y)) => float_eq(x, y),
+            (Self::Float(x), Self::Float(y)) => float_eq(*x, *y),
             (Self::Num(x), Self::Num(y)) if Rc::ptr_eq(x, y) => true,
             (Self::Num(n), y) => &Self::from_dec_str(n) == y,
             (x, Self::Num(n)) => x == &Self::from_dec_str(n),
@@ -506,9 +832,9 @@ impl Ord for Val {
             (Self::Null, Self::Null) => Equal,
             (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
             (Self::Int(x), Self::Int(y)) => x.cmp(y),
-            (Self::Int(i), Self::Float(f)) => float_cmp(&(*i as f64), f),
-            (Self::Float(f), Self::Int(i)) => float_cmp(f, &(*i as f64)),
-            (Self::Float(x), Self::Float(y)) => float_cmp(x, y),
+            (Self::Int(i), Self::Float(f)) => float_cmp(*i as f64, *f),
+            (Self::Float(f), Self::Int(i)) => float_cmp(*f, *i as f64),
+            (Self::Float(x), Self::Float(y)) => float_cmp(*x, *y),
             (Self::Num(x), Self::Num(y)) if Rc::ptr_eq(x, y) => Equal,
             (Self::Num(n), y) => Self::from_dec_str(n).cmp(y),
             (x, Self::Num(n)) => x.cmp(&Self::from_dec_str(n)),
@@ -550,33 +876,33 @@ impl Ord for Val {
     }
 }
 
-fn float_eq(left: &f64, right: &f64) -> bool {
+fn float_eq(left: f64, right: f64) -> bool {
     float_cmp(left, right) == Ordering::Equal
 }
 
-fn float_cmp(left: &f64, right: &f64) -> Ordering {
-    if *left == 0. && *right == 0. {
+fn float_cmp(left: f64, right: f64) -> Ordering {
+    if left == 0. && right == 0. {
         Ordering::Equal
     } else {
-        f64::total_cmp(left, right)
+        f64::total_cmp(&left, &right)
     }
 }
 
 impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Null => "null".fmt(f),
-            Self::Bool(b) => b.fmt(f),
-            Self::Int(i) => i.fmt(f),
+            Self::Null => write!(f, "null"),
+            Self::Bool(b) => write!(f, "{b}"),
+            Self::Int(i) => write!(f, "{i}"),
             Self::Float(x) if x.is_finite() => write!(f, "{x:?}"),
-            Self::Float(_) => "null".fmt(f),
-            Self::Num(n) => n.fmt(f),
-            Self::Str(s) => write!(f, "\"{s}\""),
+            Self::Float(_) => write!(f, "null"),
+            Self::Num(n) => write!(f, "{n}"),
+            Self::Str(s) => write!(f, "{s:?}"),
             Self::Arr(a) => {
                 write!(f, "[")?;
                 let mut iter = a.iter();
                 if let Some(first) = iter.next() {
-                    first.fmt(f)?;
+                    write!(f, "{first}")?;
                 };
                 iter.try_for_each(|x| write!(f, ",{x}"))?;
                 write!(f, "]")
@@ -585,9 +911,9 @@ impl fmt::Display for Val {
                 write!(f, "{{")?;
                 let mut iter = o.iter();
                 if let Some((k, v)) = iter.next() {
-                    write!(f, "\"{k}\":{v}")?;
+                    write!(f, "{k:?}:{v}")?;
                 }
-                iter.try_for_each(|(k, v)| write!(f, ",\"{k}\":{v}"))?;
+                iter.try_for_each(|(k, v)| write!(f, ",{k:?}:{v}"))?;
                 write!(f, "}}")
             }
         }

@@ -7,8 +7,8 @@ use alloc::vec::Vec;
 use jaq_syn::filter::{AssignOp, BinaryOp, Fold, KeyVal};
 use jaq_syn::{MathOp, Spanned, Str};
 
-pub struct Ctx {
-    defs: Vec<Filter>,
+pub(crate) struct Ctx {
+    pub defs: Vec<Filter>,
     callable: Vec<Callable>,
 }
 
@@ -22,12 +22,6 @@ const IDENTITY: AbsId = AbsId(0);
 const TOSTRING: AbsId = AbsId(IDENTITY.0 + 1);
 const EMPTY: AbsId = AbsId(TOSTRING.0 + 2);
 const RECURSE: AbsId = AbsId(EMPTY.0 + 4);
-
-pub fn root_def(def: mir::Def) -> filter::Owned {
-    let mut ctx = Ctx::default();
-    let id = ctx.def(def);
-    filter::Owned::new(id, ctx.defs)
-}
 
 impl Default for Ctx {
     fn default() -> Self {
@@ -106,9 +100,9 @@ impl Ctx {
         body
     }
 
-    fn def(&mut self, def: mir::Def) -> AbsId {
+    pub fn def(&mut self, def: mir::Def) -> AbsId {
         let id = AbsId(self.defs.len());
-        self.defs.push(Filter::default());
+        self.defs.push(Filter::Id);
         self.callable.push(Callable {
             sig: def.lhs.clone(),
             id,
@@ -203,7 +197,7 @@ impl Ctx {
             }
 
             Expr::Id => Filter::Id,
-            Expr::Num(hir::Num::Float(f)) => Filter::Float(f),
+            Expr::Num(hir::Num::Num(n)) => Filter::Num(n),
             Expr::Num(hir::Num::Int(i)) => Filter::Int(i),
             Expr::Str(s) => self.of_str(*s),
             Expr::Array(a) => Filter::Array(a.map_or(EMPTY, |a| self.get(*a))),

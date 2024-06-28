@@ -1,6 +1,6 @@
 //! Runtime errors.
-use crate::Val;
-use alloc::string::ToString;
+use crate::val::{Val, ValT};
+use alloc::string::{String, ToString};
 use core::fmt;
 
 /// Errors that can occur during filter execution.
@@ -8,16 +8,16 @@ use core::fmt;
 /// Each variant shows an example of how it can be produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Error {
+pub enum Error<V = Val> {
     /// `0 | error`
-    Val(Val),
+    Val(V),
 
     /// Expected a value of given type, but got something else
-    Type(Val, Type),
+    Type(V, Type),
     /// `1 - "a"`
-    MathOp(Val, jaq_syn::MathOp, Val),
+    MathOp(V, jaq_syn::MathOp, V),
     /// `{} | .[0]` or `[] | has("a")` or `{} | has(0)`
-    Index(Val, Val),
+    Index(V, V),
 
     /// `[] | .[0] = 0`
     IndexOutOfBounds(isize),
@@ -28,7 +28,7 @@ pub enum Error {
     ///
     /// This is used internally to execute tail-recursive filters.
     /// If this can be observed by users, then this is a bug.
-    TailCall(crate::filter::TailCall),
+    TailCall(crate::filter::TailCall<V>),
 }
 
 /// Types and sets of types.
@@ -51,26 +51,33 @@ pub enum Type {
     Range,
 }
 
-impl Error {
+impl<V: ValT> Error<V> {
     /// Convert the error into a value to be used by `catch` filters.
-    pub fn as_val(self) -> Val {
+    pub fn as_val(self) -> V {
         match self {
             Self::Val(ev) => ev,
-            _ => Val::str(self.to_string()),
+            _ => V::from(self.to_string()),
         }
-    }
-
-    /// Build an error from something that can be converted to a string.
-    pub fn str(s: impl ToString) -> Self {
-        Self::Val(Val::str(s.to_string()))
     }
 }
 
-impl fmt::Display for Error {
+impl<V: From<String>> Error<V> {
+    /// Build an error from something that can be converted to a string.
+    pub fn str(s: impl ToString) -> Self {
+        Self::Val(V::from(s.to_string()))
+    }
+}
+
+impl<V: ValT> fmt::Display for Error<V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Val(Val::Str(s)) => s.fmt(f),
-            Self::Val(v) => v.fmt(f),
+            Self::Val(v) => {
+                if let Some(s) = v.as_str() {
+                    write!(f, "{s}")
+                } else {
+                    write!(f, "{v}")
+                }
+            }
             Self::Type(v, ty) => write!(f, "cannot use {v} as {ty}"),
             Self::MathOp(l, op, r) => write!(f, "cannot calculate {l} {op} {r}"),
             Self::Index(v, i) => write!(f, "cannot index {v} with {i}"),

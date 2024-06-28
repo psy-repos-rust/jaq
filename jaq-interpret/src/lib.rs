@@ -61,10 +61,13 @@ pub mod results;
 mod stack;
 mod val;
 
+#[allow(dead_code)]
+mod exn;
+
 pub use error::Error;
 pub use filter::{Args, FilterT, Native, Owned as Filter, RunPtr, UpdatePtr};
 pub use rc_iter::RcIter;
-pub use val::{Val, ValR, ValRs};
+pub use val::{Val, ValR, ValRs, ValT};
 
 use alloc::{string::String, vec::Vec};
 use jaq_syn::Arg as Bind;
@@ -73,31 +76,31 @@ use stack::Stack;
 
 /// variable bindings
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Vars(RcList<Bind<Val, (filter::Id, Self)>>);
-type Inputs<'i> = RcIter<dyn Iterator<Item = Result<Val, String>> + 'i>;
+struct Vars<V>(RcList<Bind<V, (filter::Id, Self)>>);
+type Inputs<'i, V> = RcIter<dyn Iterator<Item = Result<V, String>> + 'i>;
 
-impl Vars {
-    fn get(&self, i: usize) -> Option<&Bind<Val, (filter::Id, Self)>> {
+impl<V> Vars<V> {
+    fn get(&self, i: usize) -> Option<&Bind<V, (filter::Id, Self)>> {
         self.0.get(i)
     }
 }
 
 /// Filter execution context.
 #[derive(Clone)]
-pub struct Ctx<'a> {
-    vars: Vars,
-    inputs: &'a Inputs<'a>,
+pub struct Ctx<'a, V = Val> {
+    vars: Vars<V>,
+    inputs: &'a Inputs<'a, V>,
 }
 
-impl<'a> Ctx<'a> {
+impl<'a, V> Ctx<'a, V> {
     /// Construct a context.
-    pub fn new(vars: impl IntoIterator<Item = Val>, inputs: &'a Inputs<'a>) -> Self {
+    pub fn new(vars: impl IntoIterator<Item = V>, inputs: &'a Inputs<'a, V>) -> Self {
         let vars = Vars(RcList::new().extend(vars.into_iter().map(Bind::Var)));
         Self { vars, inputs }
     }
 
     /// Add a new variable binding.
-    pub(crate) fn cons_var(mut self, x: Val) -> Self {
+    pub(crate) fn cons_var(mut self, x: V) -> Self {
         self.vars.0 = self.vars.0.cons(Bind::Var(x));
         self
     }
@@ -116,13 +119,13 @@ impl<'a> Ctx<'a> {
         self
     }
 
-    fn with_vars(&self, vars: Vars) -> Self {
+    fn with_vars(&self, vars: Vars<V>) -> Self {
         let inputs = self.inputs;
         Self { vars, inputs }
     }
 
     /// Return remaining input values.
-    pub fn inputs(&self) -> &'a Inputs<'a> {
+    pub fn inputs(&self) -> &'a Inputs<'a, V> {
         self.inputs
     }
 }
@@ -134,7 +137,7 @@ pub struct ParseCtx {
     /// errors occurred during transformation
     // TODO for v2.0: remove this and make it a function
     pub errs: Vec<jaq_syn::Spanned<hir::Error>>,
-    native: Vec<(String, usize, filter::Native)>,
+    native: Vec<((String, usize), filter::Native)>,
     def: jaq_syn::Def,
 }
 
@@ -165,7 +168,7 @@ impl ParseCtx {
 
     /// Add a native filter with given name and arity.
     pub fn insert_native(&mut self, name: String, arity: usize, f: filter::Native) {
-        self.native.push((name, arity, f));
+        self.native.push(((name, arity), f));
     }
 
     /// Add native filters with given names and arities.
@@ -173,6 +176,9 @@ impl ParseCtx {
     where
         I: IntoIterator<Item = (String, usize, filter::Native)>,
     {
+        let natives = natives
+            .into_iter()
+            .map(|(name, arity, f)| ((name, arity), f));
         self.native.extend(natives);
     }
 
@@ -198,7 +204,8 @@ impl ParseCtx {
     /// Given a main filter (consisting of definitions and a body), return a finished filter.
     pub fn compile(&mut self, main: jaq_syn::Main) -> Filter {
         let mut hctx = hir::Ctx::default();
-        hctx.native = self.native.clone();
+        let native = self.native.iter().map(|(sig, _)| sig.clone());
+        hctx.native = native.collect();
         self.def.rhs.defs.extend(main.defs);
         self.def.rhs.body = main.body;
         let def = hctx.def(self.def.clone());
@@ -211,7 +218,10 @@ impl ParseCtx {
         //std::dbg!(&def);
         let def = mctx.def(def, Default::default());
 
-        lir::root_def(def)
+        let mut lctx = lir::Ctx::default();
+        let id = lctx.def(def);
+        let native = self.native.iter().map(|(_sig, native)| native.clone());
+        filter::Owned::new(id, lctx.defs.into(), native.collect())
     }
 
     /// Compile and run a filter on given input, panic if it does not compile or yield the given output.
